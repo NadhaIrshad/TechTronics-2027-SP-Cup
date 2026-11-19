@@ -1,0 +1,64 @@
+# ---------- Data & generated outputs (never commit raw/degraded videos) ----------
+data/**
+!data/**/
+!data/**/.gitkeep
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+submission/**/*.mat
+submission/**/*.mp4
+submission/**/*.avi
+
+# Video / large binary files anywhere in the repo
+*.avi
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.zip
+*.tar.gz
+
+# ---------- MATLAB ----------
+*.asv
+*.m~
+*.mex*
+*.autosave
+slprj/
+codegen/
+*.slxc
+*.mlappinstall
+*.mltbx
+resources/project/
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+
+# ---------- LaTeX (report) build artefacts ----------
+report/**/*.aux
+report/**/*.log
+report/**/*.out
+report/**/*.bbl
+report/**/*.blg
+report/**/*.fls
+report/**/*.fdb_latexmk
+report/**/*.synctex.gz
+report/**/*.toc
+
+# ---------- OS / editors ----------
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+.claude/settings.local.json

@@ -1,0 +1,16 @@
+# Normalise line endings (team uses Linux + Windows)
+* text=auto
+*.m    text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.csv  text eol=lf
+*.sh   text eol=lf
+
+# Binary files
+*.mat  binary
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.mp4  binary
+*.avi  binary
