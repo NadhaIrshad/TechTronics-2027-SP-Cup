@@ -42,7 +42,7 @@ Video ─► (Constraint simulation) ─► Face detection & tracking ─► ROI
 ## Datasets
 
 - **UBFC-rPPG:** https://sites.google.com/view/ybenezeth/ubfcrppg
-- **AiPEX rppg_biases:** https://github.com/AiPEXLab/rppg_biases
+- **AiPEX rppg_biases:** https://github.com/AiPEX-Lab/rppg_biases
 - **Organizer dataset (Sri Ramachandra):** covered by a data agreement. Keep it on team machines only.
 
 Put the datasets under `data/raw/`. **Do not commit videos or `.mat` data files.** The `data/` and `outputs/` folders are gitignored.
