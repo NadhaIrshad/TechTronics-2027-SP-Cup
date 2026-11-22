@@ -157,7 +157,22 @@ Rows with `quality = 0` are NaN. Interpolate across them or mask them out before
 
 ## 7. Results: face module + baseline signal (POS)
 
-UBFC-rPPG DATASET_2, 8 subjects (1, 3, 4, 12, 17, 26, 31, 34), 420 ten-second HR windows per condition, reference HR from the contact PPG, CPU, config v1.2.
+UBFC-rPPG DATASET_2, reference HR from the contact PPG, 10 s windows every 1 s, CPU, config v1.2.
+There is **no training step**: all parameters are fixed by hand. Subjects 1 and 17 were looked at while
+setting parameters (ROI placement, relative occlusion rule), so they form the **tuning set**. The other
+six subjects were never used for any decision and form the **test set**.
+
+### Test set: held-out subjects 3, 4, 12, 26, 31, 34 (318 windows per condition)
+
+| Condition | Target found | ID switches | HR MAE (bpm) | RMSE | r | SUC@3 | SUC@5 | Bland–Altman bias [limits of agreement] | Occlusion accuracy | ms/frame |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Baseline (640×480) | 100 % | 0 | **1.28** | 2.14 | 0.86 | 92.5 % | 96.8 % | −0.46 [−5.6, +4.7] | 100 % | 8.8 |
+| QVGA 320×240 (C4) | 100 % | 0 | **1.42** | 2.36 | 0.84 | 91.2 % | 96.0 % | −0.57 [−6.1, +5.0] | 100 % | 6.2 |
+| MultiFace (C3) | 100 % | 0 | **1.28** | 2.15 | 0.86 | 92.5 % | 96.8 % | −0.46 [−5.6, +4.7] | 100 % | 9.1 |
+| Masked (C7) | 100 % | 0 | **1.45** | 2.40 | 0.84 | 91.1 % | 95.7 % | −0.60 [−6.3, +5.1] | 100 % | 7.4 |
+| Stress (C3 + C4 + C7) | 100 % | 0 | **1.48** | 2.47 | 0.83 | 90.8 % | 95.3 % | −0.62 [−6.4, +5.2] | 100 % | 6.0 |
+
+### All 8 subjects: 1, 3, 4, 12, 17, 26, 31, 34 (tuning + test, 420 windows per condition)
 
 | Condition | Target found | ID switches | HR MAE (bpm) | RMSE | r | SUC@3 | SUC@5 | Bland–Altman bias [limits of agreement] | Occlusion accuracy | ms/frame |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -173,15 +188,18 @@ UBFC-rPPG DATASET_2, 8 subjects (1, 3, 4, 12, 17, 26, 31, 34), 420 ten-second HR
   - MultiFace = a second real UBFC subject pasted beside the target at 75 % size.
   - Masked = a synthetic light-blue mask polygon over more than 40 % of the lower face.
 - **HR:** `rgb_face` is resampled to 30 Hz on the real timestamps, then POS, a 0.7–3 Hz Butterworth filter, 10 s windows every 1 s, and the periodogram peak. The reference uses the same steps on the contact PPG (`ground_truth.txt`, line 1).
-- **MAE, RMSE, r:** mean over subjects. **SUC@k:** % of windows with |error| < k bpm. **Bland–Altman:** pooled over all windows.
+- **MAE, RMSE, r:** mean over subjects. **SUC@k:** % of windows with |error| < k bpm. **Bland–Altman:** pooled over all windows of the set.
+- **Per-subject Baseline MAE (bpm):** s34 0.30, s26 0.39, s31 0.71, s12 1.04, s1 1.47, s17 2.26, s4 2.38, s3 2.84.
+- **The test set scores no worse than the full set** (MAE 1.28 vs 1.42), so the hand tuning did not inflate the results.
+- **Tables:** test set in `outputs/tables/heldout/`, all subjects in `outputs/tables/`.
 - **ID switches:** frames where the output box overlaps the bystander more than the target. **Occlusion accuracy:** per-region flags against the expected pattern.
 
-**Findings:**
+**Findings (test set):**
 - **C3:** the bystander has no effect (0 switches; HR identical to Baseline).
-- **C4:** QVGA costs only +0.11 bpm.
-- **C7:** occluded cheeks are flagged in 100 % of frames.
-- **All three combined:** +0.09 bpm.
-- **Wide limits of agreement:** these come from a few windows where the plain spectral peak locks onto the wrong frequency (mainly subject 17, whose HR varies). That's a signal-processing limitation, not a face-module error.
+- **C4:** QVGA costs +0.14 bpm.
+- **C7:** occluded cheeks are flagged in 100 % of frames. HR comes from the uncovered regions (+0.17 bpm).
+- **All three combined:** +0.20 bpm.
+- **Limits of agreement:** about ±5 bpm on the test set. They widen to about ±7 bpm on all 8 subjects because of a few windows where the plain spectral peak locks onto the wrong frequency (mainly subject 17, whose HR varies). That's a signal-processing limitation, not a face-module error.
 
 ### Design decisions and lessons
 - **CPU detection by default.** On a GPU, RetinaFace output varies slightly between runs, which changed some re-anchor decisions and shifted HR by up to 0.45 bpm. On CPU, runs are bit-identical.
