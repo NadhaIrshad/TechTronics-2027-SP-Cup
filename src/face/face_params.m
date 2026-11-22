@@ -52,9 +52,9 @@ p.roi.nose     = [0.44 0.40 0.56 0.58];
 p.roi.lmalar   = [0.15 0.46 0.38 0.60];
 p.roi.rmalar   = [0.62 0.46 0.85 0.60];
 
-p.skin.cb     = [77 127];              % YCbCr skin box (uint8 scale)
-p.skin.cr     = [133 173];
-p.skin.yMin   = 25;
+p.skin.cb     = [77 135];              % YCbCr skin box (uint8 scale), widened for dark skin (AiPEX)
+p.skin.cr     = [128 173];
+p.skin.yMin   = 20;
 p.skin.satMax = 250;
 
 p.occl.reference = "forehead";         % region the relative rule compares against
