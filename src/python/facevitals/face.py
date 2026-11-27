@@ -1,7 +1,12 @@
 """
 Face box, ROI, skin mask, RGB traces and ITA.
 
-Python counterpart of the MATLAB face module (src/face). Shared with it:
+tracked_face_traces(): port of src/face/process_video.m on top of tracker.FaceTracker
+(RetinaFace + Kalman/Hungarian + KLT, One-Euro, occlusion hysteresis). This is the default
+face module of run_c2.py and follows the MATLAB algorithm step by step.
+
+face_traces(): the earlier simplified version, kept as --face-module simple. Python
+counterpart of the MATLAB face module (src/face). Shared with it:
   - ROI boxes as face-box fractions from config/face_config.json
   - YCbCr skin mask with MATLAB rgb2ycbcr (studio-range) coefficients, same thresholds
   - rgb_face = pixel-weighted mean of the non-occluded regions
@@ -304,6 +309,126 @@ def face_traces(path, roi, skin, occl, max_width=960, ita_every=30, box_alpha=0.
                skin_ratio=np.array(ratio), occluded=np.array(occ), quality=np.array(Q),
                roi_names=np.array(names), fps=fps, ita_samples=ita,
                rgb_bg=np.array(bg).reshape(-1, 3), bg_npix=np.array(bgn), face_box=np.array(boxes).reshape(-1, 4))
+    for i, n in enumerate(names):
+        out["rgb_" + n] = reg[:, i, :]
+    return out
+
+
+def roi_skin_stats(I, poly, skin):
+    """roi_skin_stats.m: skin pixels inside one ROI polygon (Kx2 [x y], 0-based).
+    Returns (rgb_sum (3,), n_skin, n_poly, patch, mask) - patch/mask of the bounding rectangle."""
+    from skimage.draw import polygon2mask
+    H, W = I.shape[:2]
+    if poly is None or not np.all(np.isfinite(poly)):
+        return np.zeros(3), 0, 0, None, None
+    x1 = max(0, int(np.floor(poly[:, 0].min()))); x2 = min(W - 1, int(np.ceil(poly[:, 0].max())))
+    y1 = max(0, int(np.floor(poly[:, 1].min()))); y2 = min(H - 1, int(np.ceil(poly[:, 1].max())))
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(3), 0, 0, None, None
+    in_poly = polygon2mask((y2 - y1 + 1, x2 - x1 + 1), np.column_stack([poly[:, 1] - y1, poly[:, 0] - x1]))
+    patch = I[y1:y2 + 1, x1:x2 + 1]
+    M = in_poly & skin_mask(patch, skin)
+    n_skin = int(M.sum())
+    s = patch[M].sum(axis=0, dtype=np.float64) if n_skin else np.zeros(3)
+    return s, n_skin, int(in_poly.sum()), patch, M
+
+
+def tracked_face_traces(path, p=None, detector=None, ita_every=30, max_frames=None, max_width=None,
+                        verbose=False):
+    """
+    Port of src/face/process_video.m on top of tracker.FaceTracker (RetinaFace, Kalman +
+    Hungarian, KLT + similarity transform), with the same per-frame ROI steps:
+    roi_polygons -> One-Euro smoothing of all polygon corners and the face box ->
+    skin pixels per polygon -> occlusion (absolute AND relative rule, both with hysteresis on
+    the EMA-smoothed skin ratio, or n_skin < minPix) -> rgb_face over non-occluded regions.
+    Frames with quality 0 are NaN and reset the smoother and occlusion states.
+
+    Extra outputs used by the C2 evaluation (not in MATLAB): rgb_bg / bg_npix (background
+    illumination reference) and ita_samples (L*, b* of each region's skin every ita_every frames).
+    max_width=None processes the native resolution, as MATLAB does.
+    """
+    from .retinaface import RetinaFaceDetector
+    from .tracker import FaceTracker, OneEuroFilter, face_params, roi_polygons
+
+    p = p or face_params()
+    skin = p["skin"]
+    names = list(p["roi"]["names"])
+    nR = len(names)
+    occl = p["occl"]
+    ref_idx = names.index(occl["reference"]) if occl["reference"] in names else 0
+    use_rel = occl["reference"] in names
+    det = detector or RetinaFaceDetector(p["det"]["threshold"], p["det"]["minSize"])
+
+    fps, frames = open_video(path, max_width)
+    tracker = smoother = None
+    ratio_ema = np.full(nR, np.nan)
+    abs_state = np.zeros(nR, bool)
+    rel_state = np.zeros(nR, bool)
+
+    T, Q, NF, TID, face, reg, npix, ratio, occ, bg, bgn, boxes = ([] for _ in range(12))
+    ita = {n: [] for n in names}
+    for k, t, rgb in frames:
+        if max_frames and k >= max_frames:
+            break
+        if tracker is None:
+            tracker = FaceTracker(det, p, rgb.shape[:2])
+            smoother = OneEuroFilter(p["smooth"]["minCutoff"], p["smooth"]["beta"], p["smooth"]["dCutoff"])
+        T.append(t)
+        st = tracker.step(rgb, t)
+        Q.append(st["quality"]); NF.append(st["n_faces"]); TID.append(st["target_id"])
+        fr, rr = np.full(3, np.nan), np.full((nR, 3), np.nan)
+        nn, ra, oc = np.zeros(nR), np.full(nR, np.nan), np.zeros(nR, bool)
+        fbox = None
+        if st["quality"] == 0:
+            smoother.reset()
+            ratio_ema[:] = np.nan; abs_state[:] = False; rel_state[:] = False
+        else:
+            R = roi_polygons(st["anchor_box"], st["A"], p["roi"])
+            vec = np.concatenate([R[n].T.ravel() for n in names] + [R["box"]])   # MATLAB column-major P(:)
+            if p["smooth"]["enable"]:
+                vec = smoother.update(vec, t)
+            fbox = vec[-4:]
+            sums, nS = np.zeros((nR, 3)), np.zeros(nR)
+            for r, n in enumerate(names):
+                P = vec[8 * r:8 * r + 8].reshape(2, 4).T
+                s, ns, npoly, patch, M = roi_skin_stats(rgb, P, skin)
+                sums[r], nS[r] = s, ns
+                ra[r] = ns / max(npoly, 1)
+                ratio_ema[r] = ra[r] if np.isnan(ratio_ema[r]) else \
+                    (1 - occl["emaAlpha"]) * ratio_ema[r] + occl["emaAlpha"] * ra[r]
+                if k % ita_every == 0 and M is not None:
+                    v = region_lab(patch, M)
+                    if v is not None:
+                        ita[n].append(v)
+            s_all, n_all = np.zeros(3), 0
+            for r in range(nR):
+                abs_state[r] = ratio_ema[r] < (occl["offAbove"] if abs_state[r] else occl["onBelow"])
+                if not use_rel or r == ref_idx:
+                    rel_state[r] = True
+                else:
+                    rel = ratio_ema[r] / max(ratio_ema[ref_idx], np.finfo(float).eps)
+                    rel_state[r] = rel < (occl["relOff"] if rel_state[r] else occl["relOn"])
+                oc[r] = (abs_state[r] and rel_state[r]) or nS[r] < occl["minPix"]
+                nn[r] = nS[r]
+                if nS[r] > 0:
+                    rr[r] = sums[r] / nS[r]
+                if not oc[r]:
+                    s_all += sums[r]; n_all += nS[r]
+            if n_all > 0:
+                fr = s_all / n_all
+        b_rgb, b_n = background_rgb(rgb, fbox, skin)
+        face.append(fr); reg.append(rr); npix.append(nn); ratio.append(ra); occ.append(oc)
+        bg.append(b_rgb); bgn.append(b_n); boxes.append(np.full(4, np.nan) if fbox is None else fbox)
+        if verbose and k % 300 == 0:
+            print(f"   frame {k}  q={st['quality']}  faces={st['n_faces']}", flush=True)
+
+    reg = np.array(reg).reshape(-1, nR, 3)
+    out = dict(t=_fix_times(T, fps), rgb_face=np.array(face).reshape(-1, 3), npix=np.array(npix),
+               skin_ratio=np.array(ratio), occluded=np.array(occ), quality=np.array(Q),
+               n_faces=np.array(NF), target_id=np.array(TID, float), roi_names=np.array(names), fps=fps,
+               ita_samples=ita, rgb_bg=np.array(bg).reshape(-1, 3), bg_npix=np.array(bgn),
+               face_box=np.array(boxes).reshape(-1, 4),
+               n_detector_calls=tracker.num_detections if tracker else 0)
     for i, n in enumerate(names):
         out["rgb_" + n] = reg[:, i, :]
     return out

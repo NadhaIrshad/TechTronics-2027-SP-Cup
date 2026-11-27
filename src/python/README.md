@@ -5,7 +5,12 @@ This is a Python port of the MATLAB face module and baseline HR, so it runs with
 
 ## Requirements
 
-Python 3.11 with `opencv-python`, `mediapipe`, `scikit-image`, `scipy`, `pandas`, `openpyxl`.
+Python 3.11 with `opencv-python`, `torch` + `torchvision` (CPU is enough), `mediapipe`,
+`scikit-image`, `scipy`, `pandas`, `openpyxl`.
+
+RetinaFace weights (`mobilenet0.25_Final.pth`, 1.8 MB, WIDER FACE) are downloaded on first use to
+`models/retinaface/` (gitignored), checked against a fixed SHA-256 and loaded with
+`torch.load(weights_only=True)`.
 
 Datasets are read from the folder that contains the repo (`D:/SPCUP`), as downloaded:
 `UBFC-rPPG/`, `MPU rppg/`, `CLBP-400_Samples/`, `rppg_biases-main/`, `SRMC_N/`.
@@ -32,14 +37,36 @@ parallel runs use independent processes (`--shard`), not a process pool. Traces 
 
 ## What it does
 
-| Step | Same as MATLAB | Difference |
+### Face module (`--face-module tracker`, default)
+
+A line-by-line port of the MATLAB face module (`src/face/`), same algorithm and the same
+parameters (`face_params.m` defaults + `config/face_config.json`):
+
+| MATLAB | Python | Note |
 |---|---|---|
-| Face box | | MediaPipe full-range detector (RetinaFace needs R2025a+); box extended 15 % upwards to cover the forehead; largest face only (no C3 multi-face tracking, no KLT); exponential box smoothing instead of One-Euro |
-| ROI | Face-box fractions from `config/face_config.json` | |
-| Skin mask | YCbCr box with MATLAB `rgb2ycbcr` coefficients, same thresholds | |
-| Occlusion | `rgb_face` = pixel-weighted mean of non-occluded regions | Absolute skin-ratio rule only |
-| HR | `sanity_hr.m`, `ppg_hr.m`, `spectral_hr.m` ported line by line: 30 Hz resampling on real timestamps, POS, Butterworth 0.7–3 Hz, 10 s windows every 1 s, periodogram peak | |
-| ITA | | `rgb2lab` (sRGB, D65) on the same skin pixels as HR, every 30th frame; median L\*, b\* per region; region L\* > 15 below the median is dropped as hair/shadow |
+| `faceDetector("small-network")` (RetinaFace) | `facevitals/retinaface.py`: RetinaFace MobileNet-0.25 | Same detector and backbone, public WIDER FACE weights (MathWorks' trained model cannot be loaded in Python, so boxes can differ slightly). Threshold 0.5, MinSize 10 px, CPU |
+| `FaceTracker.m` | `facevitals/tracker.py` `FaceTracker` | Detection every `det.every` frames (`everyLost` when lost), search window after KLT failure, target choice (largest-central / `trk.targetBox`), re-acquisition rules, re-anchoring at IoU < 0.75 |
+| `configureKalmanFilter("ConstantVelocity", …)` | `KalmanCV` | State [x vx y vy], P0 = diag(200, 50), Q = diag(100, 25), R = 100 |
+| `assignDetectionsToTracks` | `assign_detections_to_tracks` | Hungarian on 1 − IoU, padded with cost of non-assignment 0.5, gate at IoU < 0.1 |
+| `detectMinEigenFeatures` + `vision.PointTracker` | `cv2.goodFeaturesToTrack` + `cv2.calcOpticalFlowPyrLK` | Min-eigenvalue corners (300, quality 0.01, inset box), 31×31 window, 3 levels, forward-backward error ≤ 2 px |
+| `estgeotform2d("similarity")` | `cv2.estimateAffinePartial2D` (RANSAC, 3 px) | Scale sanity check 0.5–2, point refresh below 50 % |
+| `OneEuroFilter.m`, `roi_polygons.m`, `apply_tform.m`, `box_iou.m`, `clip_box.m` | same names in `tracker.py` | Coordinates 0-based |
+| `process_video.m`, `roi_skin_stats.m`, `skin_mask.m` | `face.tracked_face_traces`, `face.roi_skin_stats`, `face.skin_mask` | One-Euro on all polygon corners + box; YCbCr skin mask with MATLAB `rgb2ycbcr` coefficients; occlusion = absolute AND relative rule with hysteresis on the EMA skin ratio, or < 10 skin px; NaN frames when lost |
+| `sanity_hr.m`, `ppg_hr.m`, `spectral_hr.m` | `facevitals/rppg.py` | 30 Hz resampling on real timestamps, POS, Butterworth 0.7–3 Hz, 10 s windows every 1 s, periodogram peak |
+
+Check on UBFC subject1 (full video): MATLAB README 1.47 bpm, this port 1.41 bpm; the detector ran
+on 155 of 1547 frames (every 10th), one face, no false occlusion. Speed ≈ 30 ms/frame at 640×480
+on CPU (plus a one-time ~10 s torch import).
+
+Extra outputs for the C2 evaluation (not in MATLAB): the background trace (`rgb_bg`, below) and
+ITA samples: `rgb2lab` (sRGB, D65) on the same skin pixels as HR, every 30th frame; median L\*, b\*
+per region; a region with L\* > 15 below the median is dropped as hair/shadow.
+
+`--face-module simple` keeps the earlier development version (MediaPipe largest face, box
+extended 15 % upwards, exponential smoothing, absolute occlusion rule only). It has its own trace
+cache (`outputs/traces_py/` vs `outputs/traces_py/tracker/`) and its tables carry a `_simple`
+suffix, so the two are never merged. AiPEX clips are crops, so face detection is skipped and both
+modules give identical AiPEX results.
 
 ### Background-reference rejection (`--method pos_bg`)
 
@@ -86,6 +113,24 @@ out of every region (as in `pos_bg`); it equals `pos_snr` on AiPEX. Rows contain
 **Control `pos_eq`:** the same per-region POS and spectrum fusion with equal weights (SNR⁰ = 1).
 `pos_eq` vs `pos` measures the gain from fusing region *spectra* instead of averaging *pixels*;
 `pos_snr` vs `pos_eq` measures what the SNR weights add on top. Columns: `eq_mae`, `eq_suc5_pct`, ...
+
+### Kalman denoising (`pos_kf`) and the combination (`pos_kf_snr`, `pos_kf_snr_bg`)
+
+`rppg.kalman_denoise` is a port of `src/signal/kalman_denoise.m` from the team branch
+`thamilezai_dev` (checked against the MATLAB function on a real AiPEX trace: max difference
+3e-14, same NaN handling). Per RGB channel, a random-walk level is tracked with measurement noise
+R0·median(npix)/npix(k) (fewer skin pixels → trusted less); the steady-state filter is a
+first-order low-pass with −3 dB at 4 Hz, above the HR band. It works **before POS** (cleaner
+input, so POS's σ₁/σ₂ weighting is not dominated by frame noise); SNR fusion works **after POS**
+(chooses between regions), so they can be stacked:
+
+- `pos_kf`: denoise `rgb_face` (weighted by its non-occluded skin pixels), then baseline POS.
+- `pos_kf_snr`: denoise each region (weighted by its own skin pixels), then per-region POS + SNR fusion.
+- `pos_kf_snr_bg`: as `pos_kf_snr` with the background regression.
+
+AiPEX crops carry no pixel counts, so there the filter is unweighted (a fixed exponential
+smoother). Recording-level datasets also store `*_mae_meanagg`: the MAE when the recording HR is
+the **mean** of the window HRs, as in `aipex_hr.m`, next to our **median**.
 
 Limitation: SNR is measured around each region's own peak, so a region locked onto a strong
 artefact can look "clean". The background regression in `pos_snr_bg` reduces that risk.
@@ -174,7 +219,7 @@ the darkest group (V–VI, 56 recordings) has the lowest error; India and Sierra
   lower-quality recordings; the dark group is the reliable part.
 - One mean HR per recording: only the recording-level estimate is validated, not tracking.
 
-## Results: other datasets (mean subject MAE, bpm)
+## Results: other datasets (mean subject MAE, bpm; `--face-module simple`, to be rerun with the tracker)
 
 | Dataset | n | `pos` | `pos_bg` | `pos_eq` | `pos_snr` | `pos_snr_bg` |
 |---|---|---|---|---|---|---|

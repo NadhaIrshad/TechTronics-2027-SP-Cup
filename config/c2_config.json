@@ -10,5 +10,7 @@
   "max_width": 960,
   "ita_every": 30,
   "bg_kappa": 1.0,
-  "snr_power": 1.0
+  "snr_power": 1.0,
+  "face_module": "tracker",
+  "tracker_max_width": null
 }

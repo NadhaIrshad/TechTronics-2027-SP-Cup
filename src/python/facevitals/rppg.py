@@ -200,6 +200,59 @@ def sanity_hr_bg(t, rgb, rgb_bg, win=10.0, step=1.0, band=BAND, centers=None, ka
     return (hr, tc, details) if return_details else (hr, tc)
 
 
+# --------------------------------------------------------------- Kalman denoising (team, thamilezai_dev)
+
+def kalman_denoise(x, fs, npix=None, cutoff=4.0):
+    """
+    Port of src/signal/kalman_denoise.m (branch thamilezai_dev): causal per-channel Kalman
+    denoising of frame-mean RGB traces.
+
+    Model per channel: level = random walk (process noise Q), measurement = level + noise R_k,
+    R_k = R0 * median(npix) / npix(k) (a mean over fewer skin pixels is trusted less).
+    R0 = var(diff(x)) / 2. Q is set so that, at the median pixel count, the steady-state filter
+    is a first-order low-pass with its -3 dB point at `cutoff` Hz (default 4 Hz, above the
+    0.7-3 Hz HR band). NaN rows stay NaN. With a constant pixel count this is a fixed
+    exponential smoother.
+    """
+    x = np.asarray(x, float)
+    if x.ndim == 1:
+        x = x[:, None]
+    N, C = x.shape
+    w = 2 * np.pi * min(cutoff, 0.45 * fs) / fs
+    c = 4 - 2 * np.cos(w)
+    beta = (c - np.sqrt(c ** 2 - 4)) / 2
+    alpha = 1 - beta
+    if npix is None:
+        scale = np.ones(N)
+    else:
+        npx = np.asarray(npix, float).ravel()
+        scale = np.median(npx[npx > 0]) / np.maximum(npx, 1) if np.any(npx > 0) else np.ones(N)
+    y = np.full((N, C), np.nan)
+    for ch in range(C):
+        v = x[:, ch]
+        d = np.diff(v)
+        d = d[np.isfinite(d)]
+        R0 = np.var(d, ddof=1) / 2 if len(d) > 1 else np.nan
+        if not R0 > 0:
+            y[:, ch] = v
+            continue
+        Q = R0 * alpha ** 2 / (1 - alpha)
+        s = P = np.nan
+        for k in range(N):
+            if not np.isnan(s):
+                P = P + Q                                   # predict
+            if not np.isfinite(v[k]):
+                continue
+            if np.isnan(s):
+                s, P = v[k], R0 * scale[k]                  # initialise on first valid frame
+            else:
+                G = P / (P + R0 * scale[k])                 # update
+                s = s + G * (v[k] - s)
+                P = (1 - G) * P
+            y[k, ch] = s
+    return y
+
+
 # --------------------------------------------------------------- SNR-weighted region fusion
 
 SNR_F0_HZ = 0.1      # signal band around the peak (de Haan & Jeanne 2013)

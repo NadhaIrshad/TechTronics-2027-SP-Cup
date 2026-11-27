@@ -36,8 +36,9 @@ from scipy import stats
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from facevitals import datasets as dsets                      # noqa: E402
 from facevitals.face import (REPO, crop_traces, face_traces,    # noqa: E402
-                             load_face_config, summarize_ita)
-from facevitals.rppg import default_centers, error_stats, ppg_hr, sanity_hr, sanity_hr_bg, sanity_hr_snr  # noqa: E402
+                             load_face_config, summarize_ita, tracked_face_traces)
+from facevitals.rppg import (default_centers, error_stats, kalman_denoise, ppg_hr,  # noqa: E402
+                             sanity_hr, sanity_hr_bg, sanity_hr_snr)
 
 TABLES = REPO / "outputs" / "tables"
 TRACES = REPO / "outputs" / "traces_py"
@@ -50,9 +51,17 @@ def load_c2_config():
 
 # --------------------------------------------------------------- traces (cached)
 
-def get_traces(s, cfg, max_frames=None, rerun=False):
+_DETECTOR = None
+
+
+def get_traces(s, cfg, max_frames=None, rerun=False, module="tracker"):
+    """module "tracker": port of the MATLAB face module (RetinaFace, Kalman/Hungarian, KLT,
+    One-Euro, occlusion hysteresis). "simple": MediaPipe largest face (earlier development
+    version). Crop datasets (AiPEX) skip face detection, so both use the same traces."""
+    global _DETECTOR
     tag = f"{s.dataset}_{s.subject}" + (f"_first{max_frames}" if max_frames else "")
-    npz, js = TRACES / f"{tag}.npz", TRACES / f"{tag}_ita.json"
+    tdir = TRACES if (s.kind == "crop" or module == "simple") else TRACES / "tracker"
+    npz, js = tdir / f"{tag}.npz", tdir / f"{tag}_ita.json"
     if npz.exists() and js.exists() and not rerun:
         d = dict(np.load(npz, allow_pickle=False))
         # face traces from before the background reference was added are recomputed
@@ -63,10 +72,18 @@ def get_traces(s, cfg, max_frames=None, rerun=False):
     roi, skin, occl = load_face_config()
     if s.kind == "crop":
         d = crop_traces(s.video, skin, ita_every=cfg["ita_every"])
+    elif module == "tracker":
+        if _DETECTOR is None:
+            from facevitals.retinaface import RetinaFaceDetector
+            from facevitals.tracker import face_params
+            fp = face_params()
+            _DETECTOR = RetinaFaceDetector(fp["det"]["threshold"], fp["det"]["minSize"])
+        d = tracked_face_traces(s.video, detector=_DETECTOR, ita_every=cfg["ita_every"],
+                                max_frames=max_frames, max_width=cfg.get("tracker_max_width"))
     else:
         d = face_traces(s.video, roi, skin, occl, max_width=cfg["max_width"],
                         ita_every=cfg["ita_every"], max_frames=max_frames)
-    TRACES.mkdir(parents=True, exist_ok=True)
+    tdir.mkdir(parents=True, exist_ok=True)
     np.savez(npz, **{k: v for k, v in d.items() if k != "ita_samples"})
     js.write_text(json.dumps(d["ita_samples"]))
     return d
@@ -74,12 +91,13 @@ def get_traces(s, cfg, max_frames=None, rerun=False):
 
 # --------------------------------------------------------------- one subject
 
-def evaluate_subject(s, cfg, max_frames=None, rerun=False):
+def evaluate_subject(s, cfg, max_frames=None, rerun=False, module="tracker"):
     t0 = time.time()
-    d = get_traces(s, cfg, max_frames, rerun)
+    d = get_traces(s, cfg, max_frames, rerun, module)
     _, ita = summarize_ita(d["ita_samples"])
     q = np.asarray(d["quality"])
-    row = dict(dataset=s.dataset, subject=s.subject, ref=s.ref or "none", frames=len(q),
+    row = dict(dataset=s.dataset, subject=s.subject, ref=s.ref or "none",
+               face_module="crop" if s.kind == "crop" else module, frames=len(q),
                face_found_pct=100 * float((q > 0).mean()) if len(q) else np.nan, **ita)
     row.update({k: v for k, v in s.meta.items() if k in ("age", "gender", "lux", "country")})
     win, step = cfg["window_s"], cfg["step_s"]
@@ -91,10 +109,32 @@ def evaluate_subject(s, cfg, max_frames=None, rerun=False):
     regions = [d["rgb_" + n] for n in names if "rgb_" + n in d]
     snr_w = {}
 
-    def snr_method(c, use_bg, key, power=None):
+    # Kalman denoising (team method, thamilezai_dev): rgb_face weighted by its skin pixels,
+    # each region by its own skin pixels (crops carry no pixel counts -> unweighted)
+    fps = float(d["fps"]) if np.isfinite(float(d["fps"])) and float(d["fps"]) > 0 else 30.0
+    npix = np.asarray(d["npix"], float) if "npix" in d else None
+    if npix is not None and npix.ndim == 2 and "occluded" in d:
+        n_face = np.where(np.asarray(d["occluded"]) > 0, 0, npix).sum(axis=1)
+    else:
+        n_face = None
+    kf_cache = {}
+
+    def kf_face():
+        if "face" not in kf_cache:
+            kf_cache["face"] = kalman_denoise(d["rgb_face"], fps, npix=n_face)
+        return kf_cache["face"]
+
+    def kf_regions():
+        if "regions" not in kf_cache:
+            kf_cache["regions"] = [kalman_denoise(x, fps, npix=npix[:, r] if npix is not None and npix.ndim == 2
+                                                  and r < npix.shape[1] else None)
+                                   for r, x in enumerate(regions)]
+        return kf_cache["regions"]
+
+    def snr_method(c, use_bg, key, power=None, regs=None):
         power = cfg.get("snr_power", 1.0) if power is None else power
-        hr, _, w = sanity_hr_snr(d["t"], regions, win, step, centers=c, rgb_bg=bg if use_bg else None,
-                                 power=power, return_weights=True)
+        hr, _, w = sanity_hr_snr(d["t"], regions if regs is None else regs, win, step, centers=c,
+                                 rgb_bg=bg if use_bg else None, power=power, return_weights=True)
         snr_w[key] = w
         return hr
 
@@ -104,7 +144,11 @@ def evaluate_subject(s, cfg, max_frames=None, rerun=False):
                "snr_": lambda c: snr_method(c, False, "snr_"),
                "snrbg_": lambda c: snr_method(c, True, "snrbg_"),
                # control: same region-spectrum fusion with equal weights (SNR ** 0 = 1)
-               "eq_": lambda c: snr_method(c, False, "eq_", power=0.0)}
+               "eq_": lambda c: snr_method(c, False, "eq_", power=0.0),
+               # Kalman denoising before POS (team method), alone and stacked with SNR fusion
+               "kf_": lambda c: sanity_hr(d["t"], kf_face(), win, step, centers=c)[0],
+               "kfsnr_": lambda c: snr_method(c, False, "kfsnr_", regs=kf_regions()),
+               "kfsnrbg_": lambda c: snr_method(c, True, "kfsnrbg_", regs=kf_regions())}
     if ref is None:
         pass
     elif ref[0] in ("ppg", "hr"):
@@ -123,21 +167,23 @@ def evaluate_subject(s, cfg, max_frames=None, rerun=False):
         for pre, fn in methods.items():
             est[pre] = fn(tc)
             row.update({pre + k: v for k, v in error_stats(est[pre], hr_ref).items()})
-        windows = [dict(dataset=s.dataset, subject=s.subject, tc=c, hr_est=e, hr_est_bg=eb,
-                        hr_est_snr=es, hr_est_snrbg=esb, hr_est_eq=eq, hr_ref=r)
-                   for c, e, eb, es, esb, eq, r in zip(tc, est[""], est["bg_"], est["snr_"], est["snrbg_"],
-                                                       est["eq_"], hr_ref)]
+        windows = [dict(dataset=s.dataset, subject=s.subject, tc=c, hr_ref=r,
+                        **{"hr_est" + ("_" + pre.rstrip("_") if pre else ""): est[pre][i] for pre in est})
+                   for i, (c, r) in enumerate(zip(tc, hr_ref))]
     else:
         hr_ref = ref[1]
         row["hr_ref_mean"] = hr_ref
         for pre, fn in methods.items():
             hr_w = fn(None)
             e_hr = float(np.nanmedian(hr_w)) if np.isfinite(hr_w).any() else np.nan
+            e_mean = float(np.nanmean(hr_w)) if np.isfinite(hr_w).any() else np.nan
             err = e_hr - hr_ref
             row.update({pre + "n_windows": int(np.isfinite(hr_w).sum()), pre + "mae": abs(err),
                         pre + "rmse": abs(err), pre + "r": np.nan, pre + "bias": err,
                         pre + "suc3_pct": 100.0 * (abs(err) < 3), pre + "suc5_pct": 100.0 * (abs(err) < 5),
-                        pre + "hr_est": e_hr})
+                        pre + "hr_est": e_hr,
+                        # mean of the window HRs (as in aipex_hr.m) instead of the median
+                        pre + "hr_est_meanagg": e_mean, pre + "mae_meanagg": abs(e_mean - hr_ref)})
     for key, w in snr_w.items():       # mean share of the fused spectrum per region
         if key == "eq_":
             continue                   # equal weights by construction
@@ -219,9 +265,13 @@ def analyze(S, cfg):
     return G, reg, pd.DataFrame(within)
 
 
+METHOD_PREFIX = {"pos": "", "pos_bg": "bg_", "pos_eq": "eq_", "pos_snr": "snr_", "pos_snr_bg": "snrbg_",
+                 "pos_kf": "kf_", "pos_kf_snr": "kfsnr_", "pos_kf_snr_bg": "kfsnrbg_"}
+
+
 def select_method(S, method):
     """Copy the chosen method's columns into mae / rmse / suc5_pct used by the statistics."""
-    pre = {"pos": "", "pos_bg": "bg_", "pos_snr": "snr_", "pos_snr_bg": "snrbg_", "pos_eq": "eq_"}[method]
+    pre = METHOD_PREFIX[method]
     if pre:
         S = S.copy()
         for k in ("mae", "rmse", "suc5_pct", "bias", "r", "n_windows"):
@@ -264,8 +314,7 @@ def compare(S):
     """Baseline POS vs background reference vs SNR-weighted region fusion."""
     pd.set_option("display.width", 250)
     S = S[np.isfinite(S["mae"])]
-    meth = [("pos", ""), ("pos_bg", "bg_"), ("pos_eq", "eq_"), ("pos_snr", "snr_"), ("pos_snr_bg", "snrbg_")]
-    meth = [(m, p) for m, p in meth if p + "mae" in S]
+    meth = [(m, p) for m, p in METHOD_PREFIX.items() if p + "mae" in S and S[p + "mae"].notna().any()]
     rows = []
     for d, D in S.groupby("dataset"):
         r = {"dataset": d, "n": len(D)}
@@ -273,6 +322,13 @@ def compare(S):
             r[f"mae_{m}"] = D[p + "mae"].mean()
             r[f"suc5_{m}"] = D[p + "suc5_pct"].mean()
         rows.append(r)
+    agg = [(m, p) for m, p in meth if p + "mae_meanagg" in S and S[p + "mae_meanagg"].notna().any()]
+    if agg:
+        print("\n=== Recording-level datasets: MAE with median (ours) vs mean (aipex_hr.m) of window HRs ===")
+        R = S[S["ref"] == "mean"]
+        print(R.groupby("dataset").agg(**{f"{m}|median": (p + "mae", "mean") for m, p in agg},
+                                       **{f"{m}|mean": (p + "mae_meanagg", "mean") for m, p in agg}
+                                       ).T.round(2).to_string())
     print("\n=== Mean subject MAE (bpm) and SUC@5 (%) per method ===")
     print(pd.DataFrame(rows).round(2).to_string(index=False))
     cols = ["dataset", "subject", "ITA"] + [p + "mae" for _, p in meth]
@@ -298,23 +354,29 @@ def main():
                          "(one per shard) to run in parallel; then run --analyze-only to merge")
     ap.add_argument("--rerun", action="store_true", help="ignore cached traces")
     ap.add_argument("--analyze-only", action="store_true", help="merge all shard tables and report")
-    ap.add_argument("--method", default="pos", choices=["pos", "pos_bg", "pos_eq", "pos_snr", "pos_snr_bg", "compare"],
+    ap.add_argument("--method", default="pos", choices=list(METHOD_PREFIX) + ["compare"],
                     help="HR method used for the skin-tone statistics; 'compare' prints baseline vs "
                          "background-reference per dataset and subject")
     ap.add_argument("--subjects", nargs="+", default=None, help="only these subject names (quick tests)")
+    ap.add_argument("--face-module", default=None, choices=["tracker", "simple"],
+                    help="face module: 'tracker' = port of the MATLAB module (default, config "
+                         "face_module), 'simple' = MediaPipe largest face (earlier version)")
     args = ap.parse_args()
     cfg = load_c2_config()
+    module = args.face_module or cfg.get("face_module", "tracker")
     TABLES.mkdir(parents=True, exist_ok=True)
     suffix = f"_first{args.max_frames}" if args.max_frames else ""
 
     if args.analyze_only:
         parts = sorted(TABLES.glob(f"c2_subjects{suffix}_shard*.csv"))
+        parts = [q for q in parts if q.stem.endswith("_simple") == (module == "simple")]
         if not parts:
             raise SystemExit(f"no c2_subjects{suffix}_shard*.csv in {TABLES}")
         S = pd.concat([pd.read_csv(p) for p in parts]).drop_duplicates(["dataset", "subject"], keep="last")
         S = S.sort_values(["dataset", "subject"])
         S.to_csv(TABLES / f"c2_subjects{suffix}.csv", index=False)
-        wparts = sorted(TABLES.glob(f"c2_windows{suffix}_shard*.csv"))
+        wparts = [q for q in sorted(TABLES.glob(f"c2_windows{suffix}_shard*.csv"))
+                  if q.stem.endswith("_simple") == (module == "simple")]
         if wparts:
             pd.concat([pd.read_csv(p) for p in wparts]).to_csv(TABLES / f"c2_windows{suffix}.csv", index=False)
         print(f"merged {len(parts)} shard(s): {len(S)} subjects")
@@ -330,12 +392,12 @@ def main():
         subs = [x for x in subs if x.subject in args.subjects]
     subs.sort(key=lambda s: (s.dataset != "MPU", s.dataset, s.subject))   # longest videos spread first
     subs = subs[i - 1::n]
-    tag = f"{suffix}_shard{i}of{n}_" + "-".join(args.datasets) + ("_" + "-".join(args.subjects) if args.subjects else "")
-    print(f"shard {i}/{n}: {len(subs)} subjects", flush=True)
+    tag = f"{suffix}_shard{i}of{n}_" + "-".join(args.datasets) + ("_simple" if module == "simple" else "") + ("_" + "-".join(args.subjects) if args.subjects else "")
+    print(f"shard {i}/{n}: {len(subs)} subjects, face module: {module}", flush=True)
     rows, wins = [], []
     for k, s in enumerate(subs, 1):
         try:
-            row, w = evaluate_subject(s, cfg, args.max_frames, args.rerun)
+            row, w = evaluate_subject(s, cfg, args.max_frames, args.rerun, module)
         except Exception:
             print(f"[{k}/{len(subs)}] ERROR {s.dataset} {s.subject}\n{traceback.format_exc()}", flush=True)
             continue
