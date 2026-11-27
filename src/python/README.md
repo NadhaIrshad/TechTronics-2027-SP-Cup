@@ -1,7 +1,19 @@
 # Python pipeline: C2 skin-tone evaluation
 
 Runs the **same HR pipeline on every dataset** and reports the error per skin-tone group (ITA).
-This is a Python port of the MATLAB face module and baseline HR, so it runs without MATLAB R2025a+.
+The face module is a line-by-line port of the MATLAB one (`src/face`), so it runs without
+MATLAB R2025a+. HR methods compared (`--method`):
+
+| Method | Steps |
+|---|---|
+| `pos` | baseline: skin pixels of all regions averaged → POS → spectral peak (`sanity_hr.m`) |
+| `pos_bg` | `pos` with background-reference regression (lighting flicker) |
+| `pos_kf` | Kalman denoising of the RGB trace before POS (team method, `kalman_denoise.m`) |
+| `pos_eq` | POS per region, spectra fused with equal weights (control) |
+| `pos_snr` | POS per region, spectra fused with per-window SNR weights |
+| `pos_snr_bg` | `pos_snr` with background regression per region |
+| `pos_kf_snr` | Kalman per region → POS per region → SNR fusion |
+| **`pos_kf_snr_bg`** | **`pos_kf_snr` with background regression: the full method** |
 
 ## Requirements
 
@@ -20,12 +32,20 @@ UBFC subjects in `data/raw/UBFC/DATASET_2/` are also picked up.
 ## Run
 
 ```bash
-# C2 evaluation: 5 independent processes (start each one separately), then merge
-python src/python/run_c2.py --shard 1/5      # ... up to --shard 5/5
-python src/python/run_c2.py --analyze-only   # merge shard tables + statistics
+# one dataset at a time (one process; safest on a laptop with ~12 GB RAM)
+python -u src/python/run_c2.py --datasets AiPEX       # ~12 min, traces cached afterwards
+python -u src/python/run_c2.py --datasets UBFC        # ~10 min with the tracker
+python -u src/python/run_c2.py --datasets CLBP        # 4K video, ~1 h with the tracker
+
+# merge all dataset tables and report
+python src/python/run_c2.py --analyze-only --method compare        # all methods side by side
+python src/python/run_c2.py --analyze-only --method pos_kf_snr_bg  # C2 tables for one method
+
+# parallel runs: independent processes, one per shard, then --analyze-only
+python src/python/run_c2.py --shard 1/4      # ... up to --shard 4/4
 
 # quick test
-python src/python/run_c2.py --datasets UBFC --max-frames 600
+python src/python/run_c2.py --datasets UBFC --subjects subject1 --max-frames 600
 
 # skin-tone survey only (fast, includes SRMC-N, which has no ground truth), with thumbnails
 python src/python/ita_survey.py
@@ -164,59 +184,74 @@ Outputs in `outputs/tables/`: `c2_subjects.csv`, `c2_windows.csv`, `c2_groups.cs
 
 88 recordings (India 44, Sierra Leone 44). Each recording is three pre-cropped ROI clips
 (forehead 60×30, cheeks 25×25 px, upscaled to 200×200), 15 fps, compressed. Reference: one
-Masimo mean HR per recording; estimate = median of the 10 s window HRs. AiPEX has no
-background, so `pos_bg` = `pos` and `pos_snr_bg` = `pos_snr` here.
+Masimo mean HR per recording; estimate = **median** of the 10 s window HRs (the *mean* column
+reproduces `aipex_hr.m` on `thamilezai_dev`). AiPEX has no background and no face detection, so
+`*_bg` = the same method without background, and both face modules give identical results.
 
 ### Overall
 
-| Method | MAE | Median | Within 5 bpm | Bias |
-|---|---|---|---|---|
-| `pos` baseline (pixels averaged) | 16.01 | 16.50 | 13.6 % | +15.8 |
-| `pos_eq` region spectra, equal weights | 14.06 | – | 19.3 % | – |
-| **`pos_snr` region spectra, SNR weights** | **8.20** | **5.77** | **43.2 %** | **+5.7** |
+| Method | MAE (median of windows) | MAE (mean of windows) | Median MAE | Within 5 bpm | Bias |
+|---|---|---|---|---|---|
+| `pos` baseline (pixels averaged) | 16.01 | 18.56 | 16.50 | 13.6 % | +15.8 |
+| `pos_eq` region spectra, equal weights | 14.06 | 16.49 | 13.30 | 19.3 % | – |
+| `pos_kf` Kalman denoising (team) | 9.90 | 13.11 | 9.24 | 25.0 % | +9.0 |
+| `pos_snr` region spectra, SNR weights | 8.20 | 11.80 | 5.77 | 43.2 % | +5.7 |
+| **`pos_kf_snr` Kalman + SNR fusion** | **5.76** | **7.45** | **4.80** | **53.4 %** | **+0.9** |
 
-- `pos_snr` vs `pos`: 72 recordings better, 10 worse (> 1 bpm); Wilcoxon p < 0.001.
-- `pos_snr` vs `pos_eq`: 69 better, 15 worse; p < 0.001. The gain comes from the **SNR weights**,
-  not only from fusing spectra. Weights average ≈ ⅓ per region over a recording but differ per
-  window: each window trusts the region that shows a clear peak in that window.
-- AiPEX paper (Dasari et al. 2021) on the same videos: POS 14.0, CHROM 11.6, BKF 5.8 MAE.
+- **Reproduces the team MATLAB result:** with the mean of windows, `pos` 18.56 and `pos_kf` 13.11
+  match `aipex_hr.m` (18.6 → 13.1).
+- **The combination beats each part** (> 1 bpm, Wilcoxon): vs `pos_kf` 62 better / 19 worse,
+  vs `pos_snr` 56 / 25, vs `pos` 72 / 13; all p < 0.001.
+- **Why they stack:** Kalman removes fast frame noise *before* POS (POS's σ₁/σ₂ weighting is not
+  dominated by noise); SNR fusion picks the clearest region *after* POS, per window.
+- `pos_snr` vs `pos_eq`: 69 better / 15 worse, p < 0.001. The fusion gain comes from the **SNR
+  weights**, not only from fusing spectra (weights average ≈ ⅓ per region over a recording but
+  differ per window).
+- AiPEX paper (Dasari et al. 2021) on the same videos: POS 14.0, CHROM 11.6, BKF 5.8 MAE
+  (48 % within 5 bpm).
 
-### By country
+### By country (MAE, median of windows)
 
-| Country | n | `pos` MAE | `pos_eq` MAE | `pos_snr` MAE | `pos_snr` median | `pos_snr` within 5 bpm | `pos_snr` bias |
+| Country | n | `pos` | `pos_eq` | `pos_kf` | `pos_snr` | **`pos_kf_snr`** | `pos_kf_snr` median / within 5 / bias |
 |---|---|---|---|---|---|---|---|
-| India | 44 | 15.76 | 12.89 | **7.87** | 5.65 | 45.5 % | +4.5 |
-| Sierra Leone | 44 | 16.25 | 15.22 | **8.54** | 6.03 | 40.9 % | +7.0 |
+| India | 44 | 15.76 | 12.89 | 9.65 | 7.87 | **6.17** | 4.80 / 54.5 % / +0.4 |
+| Sierra Leone | 44 | 16.25 | 15.22 | 10.14 | 8.54 | **5.35** | 4.74 / 52.3 % / +1.3 |
 
 ### By skin tone (ITA group), with the C2 acceptance test
 
 Population MAE over the 85 recordings with an ITA value; a group passes if
 |group MAE − population MAE| ≤ τ = 2 bpm (fixed in `config/c2_config.json` before any result).
+MAE (deviation from population):
 
-| ITA group | n | `pos` MAE (dev.) | `pos_snr` MAE (dev.) |
-|---|---|---|---|
-| I–II (ITA > 41°) | 15 | 17.71 (+1.65) pass | 9.33 (+1.21) pass |
-| III–IV (10–41°) | 14 | 21.72 (+5.66) **fail** | 9.09 (+0.97) pass |
-| V–VI (≤ 10°) | 56 | 14.20 (−1.86) pass | **7.56 (−0.56) pass** |
-| Population | 85 | 16.06 | 8.12 |
+| ITA group | n | `pos` | `pos_kf` | `pos_snr` | **`pos_kf_snr`** (95 % CI) |
+|---|---|---|---|---|---|
+| I–II (ITA > 41°) | 15 | 17.71 (+1.65) | 10.80 (+0.95) | 9.33 (+1.21) | **5.37 (−0.29)** (3.3–7.5) |
+| III–IV (10–41°) | 14 | 21.72 (**+5.66 fail**) | 12.15 (**+2.30 fail**) | 9.09 (+0.97) | **4.66 (−1.00)** (2.8–6.8) |
+| V–VI (≤ 10°) | 56 | 14.20 (−1.86) | 9.02 (−0.83) | 7.56 (−0.57) | **5.98 (+0.33)** (4.8–7.2) |
+| Population | 85 | 16.06 | 9.85 | 8.12 | **5.66** |
+| All groups pass? | | no | no | yes | **yes** |
 
-Per country (`pos` → `pos_snr` MAE): India I–II (n = 2) 8.12 → 2.15, III–IV (8) 23.95 → 9.38,
-V–VI (32) 14.29 → 7.46; Sierra Leone I–II (13) 19.19 → 10.43, III–IV (6) 18.75 → 8.71,
-V–VI (24) 14.09 → 7.69.
-
-Only recordings with consistent ITA and no white-balance warning (27): V–VI (n = 21)
-10.07 → 5.59 MAE, 57 % within 5 bpm (I–II and III–IV have 3 each).
+- `pos_kf_snr`: every group within ±1.0 bpm of the population MAE, overlapping 95 % CIs, and no
+  trend with skin tone (Spearman ITA vs MAE ρ = −0.03, p = 0.82; baseline ρ = +0.32, p = 0.003).
+- Per country, `pos` → `pos_kf_snr`: India I–II (n = 2) 8.12 → 3.53, III–IV (8) 23.95 → 4.78,
+  V–VI (32) 14.29 → 6.25; Sierra Leone I–II (13) 19.19 → 5.65, III–IV (6) 18.75 → 4.50,
+  V–VI (24) 14.09 → 5.62.
+- Only recordings with consistent ITA and no white-balance warning (27): V–VI (n = 21) `pos` 10.07,
+  `pos_snr` 5.59, `pos_kf_snr` 6.16 MAE (I–II and III–IV have 3 each). On this subset the
+  combination is slightly behind SNR fusion alone.
 
 ### Conclusion
 
-With SNR-weighted region fusion, every ITA group is within ±1.2 bpm of the population MAE and
-the darkest group (V–VI, 56 recordings) has the lowest error; India and Sierra Leone are within
-0.7 bpm of each other. **No evidence of a performance loss for darker skin.** Caveats:
-- Absolute error is still high (8 bpm, 43 % within 5 bpm): tiny, compressed, 15 fps crops limit
-  every skin tone.
+**Kalman denoising → per-region POS → SNR fusion** lowers AiPEX MAE from 16.0 to 5.8 bpm (53 %
+within 5 bpm, bias +0.9), in both countries, and every ITA group is within ±1 bpm of the
+population MAE. **No evidence of a performance loss for darker skin.** Caveats:
+- With the combination the darkest group is no longer the lowest-error group (+0.3 bpm); the
+  difference is well inside τ and the confidence intervals overlap.
 - ITA from raw video depends on exposure and white balance. Several Sierra Leone recordings read
   "Very light" because of colour casts (b\* ≈ 1–2), so the light groups are partly mislabelled
-  lower-quality recordings; the dark group is the reliable part.
+  lower-quality recordings; the dark group (56) is the reliable part.
+- AiPEX crops have no pixel counts and no background: the Kalman filter is unweighted there (a fixed
+  low-pass) and the background reference is not tested.
 - One mean HR per recording: only the recording-level estimate is validated, not tracking.
 
 ## Results: other datasets (mean subject MAE, bpm; `--face-module simple`, to be rerun with the tracker)
